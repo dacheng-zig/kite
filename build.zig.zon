@@ -1,7 +1,17 @@
 .{
     .name = .kite,
     .version = "0.0.1",
+    .dependencies = .{
+        .zio = .{
+            .url = "https://codeload.github.com/lalinsky/zio/tar.gz/refs/tags/v0.20.1",
+            .hash = "zio-0.20.1-xHbVVI0wLwDgE2dXWDCWH0UfCQYEhnBYHs1Td12oAGeR",
+        },
+    },
     .minimum_zig_version = "0.17.1",
-    .paths = .{""},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
     .fingerprint = 0xfcee7694db4c6a0b,
 }
