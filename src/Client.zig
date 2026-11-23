@@ -667,6 +667,40 @@ pub fn deinit(self: *Client) void {
     self.* = undefined;
 }
 
+/// Explicitly populates unset proxy settings on `self.pool` from standard environment
+/// variables (`http_proxy`/`HTTP_PROXY`, `https_proxy`/`HTTPS_PROXY`,
+/// `all_proxy`/`ALL_PROXY`, `no_proxy`/`NO_PROXY`).
+///
+/// Matches Zig 0.17 `std.http.Client.initDefaultProxies` semantics without requiring a
+/// separate caller-managed arena (allocations are freed automatically by `Client.deinit()`).
+/// Asserts that no requests are currently in flight.
+pub fn initDefaultProxies(self: *Client, env_map: *const std.process.Environ.Map) !void {
+    return self.pool.initDefaultProxies(env_map);
+}
+
+/// Parses a proxy URL (`http://`, `https://`, `socks5://`, `socks5h://`, or bare `host:port`)
+/// and installs it as the fallback proxy for both `http://` and `https://` requests.
+/// Allocations are freed automatically by `Client.deinit()`.
+pub fn setProxy(self: *Client, raw_url: []const u8) !void {
+    return self.pool.setProxy(raw_url);
+}
+
+/// Parses a proxy URL and installs it specifically for `http://` (and `ws://`) requests.
+pub fn setHttpProxy(self: *Client, raw_url: []const u8) !void {
+    return self.pool.setHttpProxy(raw_url);
+}
+
+/// Parses a proxy URL and installs it specifically for `https://` (and `wss://`) requests.
+pub fn setHttpsProxy(self: *Client, raw_url: []const u8) !void {
+    return self.pool.setHttpsProxy(raw_url);
+}
+
+/// Parses a comma-separated `NO_PROXY` rule list (e.g. `"localhost, 127.0.0.0/8, .internal.corp"`)
+/// and installs it on `self.pool`.
+pub fn setNoProxy(self: *Client, raw_list: []const u8) Allocator.Error!void {
+    return self.pool.setNoProxy(raw_list);
+}
+
 pub fn activeTransport(self: *Client) Transport {
     if (self.custom_transport) |tr| return tr;
     return self.pool.transport();
@@ -1754,6 +1788,157 @@ test "Unix domain socket: http+unix URL, explicit unix_socket_path, Keep-Alive, 
         try std.testing.expectError(
             error.UnixSocketRedirectBlocked,
             client.get("http://untrusted.example/redirect"),
+        );
+    }
+}
+
+test "Client.initDefaultProxies and set*Proxy route http/https separately and honor NO_PROXY CIDR" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+
+    const ProxyStub = struct {
+        label: []const u8,
+        hits: std.atomic.Value(u32) = .init(0),
+        reject_connect_407: bool = false,
+
+        fn handle(ctx: ?*anyopaque, stream: zio.net.Stream) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            var rbuf: [1024]u8 = undefined;
+            var wbuf: [1024]u8 = undefined;
+            var sr = stream.reader(&rbuf);
+            var sw = stream.writer(&wbuf);
+
+            const req_line = sr.interface.takeDelimiterInclusive('\n') catch return;
+            while (true) {
+                const line = sr.interface.takeDelimiterInclusive('\n') catch return;
+                if (std.mem.eql(u8, line, "\r\n")) break;
+            }
+            _ = self.hits.fetchAdd(1, .acq_rel);
+
+            if (self.reject_connect_407 and std.mem.startsWith(u8, req_line, "CONNECT ")) {
+                sw.interface.writeAll(
+                    "HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                ) catch return;
+                sw.interface.flush() catch return;
+                return;
+            }
+
+            sw.interface.print(
+                "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}",
+                .{ self.label.len, self.label },
+            ) catch return;
+            sw.interface.flush() catch return;
+        }
+    };
+
+    var http_proxy_st: ProxyStub = .{ .label = "via-http-proxy" };
+    var https_proxy_st: ProxyStub = .{ .label = "via-https-proxy", .reject_connect_407 = true };
+    var direct_st: ProxyStub = .{ .label = "via-direct" };
+
+    var http_proxy_srv: MockServer = undefined;
+    try http_proxy_srv.start(&http_proxy_st, ProxyStub.handle);
+    defer http_proxy_srv.stop();
+
+    var https_proxy_srv: MockServer = undefined;
+    try https_proxy_srv.start(&https_proxy_st, ProxyStub.handle);
+    defer https_proxy_srv.stop();
+
+    var direct_srv: MockServer = undefined;
+    try direct_srv.start(&direct_st, ProxyStub.handle);
+    defer direct_srv.stop();
+
+    // 1. initDefaultProxies loads HTTP_PROXY, HTTPS_PROXY, and NO_PROXY independently
+    {
+        const http_proxy_url = try gpa.print("http://127.0.0.1:{d}", .{http_proxy_srv.port()});
+        defer gpa.free(http_proxy_url);
+        const https_proxy_url = try gpa.print("http://127.0.0.1:{d}", .{https_proxy_srv.port()});
+        defer gpa.free(https_proxy_url);
+
+        var env_map: std.process.Environ.Map = .init(gpa);
+        defer env_map.deinit();
+        try env_map.put("HTTP_PROXY", http_proxy_url);
+        try env_map.put("HTTPS_PROXY", https_proxy_url);
+        try env_map.put("NO_PROXY", "127.0.0.0/8, *.direct.local");
+
+        var client = Client.init(gpa, rt.io(), .{});
+        defer client.deinit();
+        try client.initDefaultProxies(&env_map);
+
+        // Plain HTTP target -> routed through HTTP_PROXY
+        var r_http = try client.get("http://external.example/path");
+        defer r_http.deinit();
+        try std.testing.expectEqualStrings("via-http-proxy", r_http.body);
+
+        // HTTPS target -> routed through HTTPS_PROXY (CONNECT -> 407 ProxyAuthRequired)
+        try std.testing.expectError(
+            error.ProxyAuthRequired,
+            client.get("https://secure.example/path"),
+        );
+
+        // Loopback target -> bypassed via NO_PROXY=127.0.0.0/8 CIDR and reaches direct_srv directly
+        const direct_url = try gpa.print("http://127.0.0.1:{d}/local", .{direct_srv.port()});
+        defer gpa.free(direct_url);
+        var r_direct = try client.get(direct_url);
+        defer r_direct.deinit();
+        try std.testing.expectEqualStrings("via-direct", r_direct.body);
+
+        try std.testing.expectEqual(@as(u32, 1), http_proxy_st.hits.load(.acquire));
+        try std.testing.expectEqual(@as(u32, 1), https_proxy_st.hits.load(.acquire));
+        try std.testing.expectEqual(@as(u32, 1), direct_st.hits.load(.acquire));
+    }
+
+    // 2. initDefaultProxies preserves already-configured explicit proxy while filling unset scheme
+    {
+        const https_proxy_url = try gpa.print("http://127.0.0.1:{d}", .{https_proxy_srv.port()});
+        defer gpa.free(https_proxy_url);
+
+        var env_map: std.process.Environ.Map = .init(gpa);
+        defer env_map.deinit();
+        try env_map.put("HTTP_PROXY", "http://127.0.0.1:1"); // unreachable, must NOT overwrite explicit http_proxy
+        try env_map.put("HTTPS_PROXY", https_proxy_url);
+
+        var client = Client.init(gpa, rt.io(), .{
+            .pool = .{
+                .http_proxy = .{ .host = "127.0.0.1", .port = http_proxy_srv.port() },
+            },
+        });
+        defer client.deinit();
+        try client.initDefaultProxies(&env_map);
+
+        var r_http = try client.get("http://external.example/kept");
+        defer r_http.deinit();
+        try std.testing.expectEqualStrings("via-http-proxy", r_http.body);
+
+        try std.testing.expectError(
+            error.ProxyAuthRequired,
+            client.get("https://secure.example/env-filled"),
+        );
+    }
+
+    // 3. Ergonomic URL setters (setProxy / setHttpProxy / setHttpsProxy / setNoProxy) + error safety
+    {
+        const http_proxy_url = try gpa.print("http://127.0.0.1:{d}", .{http_proxy_srv.port()});
+        defer gpa.free(http_proxy_url);
+        const https_proxy_url = try gpa.print("http://127.0.0.1:{d}", .{https_proxy_srv.port()});
+        defer gpa.free(https_proxy_url);
+
+        var client = Client.init(gpa, rt.io(), .{});
+        defer client.deinit();
+
+        try client.setProxy(http_proxy_url);
+        try client.setHttpsProxy(https_proxy_url);
+        try client.setNoProxy("127.0.0.0/8");
+        // Invalid URL fails cleanly without corrupting existing proxy or leaking memory.
+        try std.testing.expectError(error.UnsupportedProxyScheme, client.setProxy("ftp://bad:21"));
+
+        var r_http = try client.get("http://external.example/via-set");
+        defer r_http.deinit();
+        try std.testing.expectEqualStrings("via-http-proxy", r_http.body);
+
+        try std.testing.expectError(
+            error.ProxyAuthRequired,
+            client.get("https://secure.example/via-set-https"),
         );
     }
 }

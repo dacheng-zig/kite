@@ -204,7 +204,7 @@ pub const ProxyConfig = struct {
     /// Hosts/suffixes that bypass this proxy (supports `*`, exact host, `.suffix`, `host:port`).
     no_proxy: []const []const u8 = &.{},
 
-    /// Heap-owned proxy configuration returned by `ProxyConfig.fromEnv()`.
+    /// Heap-owned proxy configuration returned by `ProxyConfig.parse()` or `ProxyConfig.fromEnv()`.
     pub const Owned = struct {
         scheme: Scheme = .http,
         host: []u8,
@@ -231,33 +231,47 @@ pub const ProxyConfig = struct {
             if (self.authorization) |a| gpa.free(a);
             if (self.username) |u| gpa.free(u);
             if (self.password) |p| gpa.free(p);
-            for (self.no_proxy_entries) |e| gpa.free(e);
-            if (self.no_proxy_entries.len > 0) gpa.free(self.no_proxy_entries);
+            freeNoProxyList(gpa, self.no_proxy_entries);
             self.* = undefined;
         }
     };
 
-    /// Parses standard proxy environment variables (`HTTPS_PROXY`/`https_proxy` or
-    /// `HTTP_PROXY`/`http_proxy`, plus `ALL_PROXY` and `NO_PROXY`/`no_proxy`) from `env_map`.
-    /// Supports `http://`, `https://`, `socks5://`, and `socks5h://` proxy URLs.
-    /// Returns `null` if no proxy variable is set for `scheme`.
-    pub fn fromEnv(
-        gpa: Allocator,
-        env_map: *const std.process.Environ.Map,
-        scheme: http.Scheme,
-    ) !?Owned {
-        const raw_url = switch (scheme) {
-            .https => env_map.get("HTTPS_PROXY") orelse env_map.get("https_proxy") orelse
-                env_map.get("ALL_PROXY") orelse env_map.get("all_proxy"),
-            .http => env_map.get("HTTP_PROXY") orelse env_map.get("http_proxy") orelse
-                env_map.get("ALL_PROXY") orelse env_map.get("all_proxy"),
+    /// Scheme-aware proxy routing rules (`http_proxy`, `https_proxy`, fallback `proxy`, and `no_proxy`).
+    pub const Rules = struct {
+        proxy: ?ProxyConfig = null,
+        http_proxy: ?ProxyConfig = null,
+        https_proxy: ?ProxyConfig = null,
+        no_proxy: []const []const u8 = &.{},
+    };
+
+    /// Resolves the effective proxy for `target_origin` according to `rules`:
+    /// - `http_unix` targets always connect directly (`null`).
+    /// - `http` targets prefer `http_proxy`, falling back to `proxy`.
+    /// - `https` targets prefer `https_proxy`, falling back to `proxy`.
+    /// - Returns `null` if bypassed by either `rules.no_proxy` or the chosen proxy's `no_proxy`.
+    pub fn resolve(target_origin: http.Origin, rules: Rules) ?ProxyConfig {
+        if (target_origin.scheme == .http_unix) return null;
+
+        const chosen: ProxyConfig = switch (target_origin.scheme) {
+            .http => rules.http_proxy orelse rules.proxy orelse return null,
+            .https => rules.https_proxy orelse rules.proxy orelse return null,
             .http_unix => return null,
-        } orelse return null;
+        };
 
+        if (matchesNoProxy(rules.no_proxy, target_origin)) return null;
+        if (chosen.bypasses(target_origin)) return null;
+        return chosen;
+    }
+
+    /// Parses a proxy URL (`http://`, `https://`, `socks5://`, `socks5h://`, or bare `host:port`)
+    /// into a heap-owned `ProxyConfig.Owned`.
+    /// Credentials in the URL are percent-decoded and converted into `Proxy-Authorization`
+    /// (for HTTP/HTTPS proxies) or RFC 1929 `username`/`password` (for SOCKS5/SOCKS5h proxies).
+    pub fn parse(gpa: Allocator, raw_url: []const u8) !Owned {
         const trimmed = std.mem.trim(u8, raw_url, " \t");
-        if (trimmed.len == 0) return null;
+        if (trimmed.len == 0) return error.MissingHost;
 
-        // Allow bare "host:port" by prepending "http://".
+        // Allow bare "host:port" or "[::1]:port" by prepending "http://".
         var prefixed: ?[]u8 = null;
         defer if (prefixed) |p| gpa.free(p);
         const parse_str = if (std.mem.find(u8, trimmed, "://") == null) blk: {
@@ -275,6 +289,7 @@ pub const ProxyConfig = struct {
         else
             raw_host;
         if (stripped_host.len == 0) return error.MissingHost;
+        if (std.mem.findAny(u8, stripped_host, "\r\n\x00") != null) return error.InvalidHost;
 
         const host_owned = try gpa.alloc(u8, stripped_host.len);
         errdefer gpa.free(host_owned);
@@ -289,10 +304,10 @@ pub const ProxyConfig = struct {
         var pass_owned: ?[]u8 = null;
         errdefer if (pass_owned) |p| gpa.free(p);
 
-        if (uri.user) |user_comp| {
+        if (uri.user != null or uri.password != null) {
             var ubuf: [256]u8 = undefined;
             var pbuf: [256]u8 = undefined;
-            const user = try user_comp.toRaw(&ubuf);
+            const user = if (uri.user) |uc| try uc.toRaw(&ubuf) else "";
             const pass = if (uri.password) |pc| try pc.toRaw(&pbuf) else "";
 
             if (proxy_scheme.isSocks5()) {
@@ -310,20 +325,6 @@ pub const ProxyConfig = struct {
             }
         }
 
-        var no_proxy_list: std.ArrayList([]u8) = .empty;
-        errdefer {
-            for (no_proxy_list.items) |e| gpa.free(e);
-            no_proxy_list.deinit(gpa);
-        }
-        if (env_map.get("NO_PROXY") orelse env_map.get("no_proxy")) |raw_np| {
-            var it = std.mem.splitScalar(u8, raw_np, ',');
-            while (it.next()) |raw_entry| {
-                const entry = std.mem.trim(u8, raw_entry, " \t");
-                if (entry.len == 0) continue;
-                try no_proxy_list.append(gpa, try gpa.dupe(u8, entry));
-            }
-        }
-
         return .{
             .scheme = proxy_scheme,
             .host = host_owned,
@@ -331,28 +332,113 @@ pub const ProxyConfig = struct {
             .authorization = auth_owned,
             .username = user_owned,
             .password = pass_owned,
-            .no_proxy_entries = try no_proxy_list.toOwnedSlice(gpa),
+            .no_proxy_entries = &.{},
         };
     }
 
-    /// Returns true if `origin` matches any rule in `no_proxy` and should connect directly.
+    /// Splits a comma-separated `NO_PROXY` string into heap-owned trimmed entries.
+    pub fn parseNoProxyList(gpa: Allocator, raw: []const u8) Allocator.Error![][]u8 {
+        var list: std.ArrayList([]u8) = .empty;
+        errdefer {
+            for (list.items) |e| gpa.free(e);
+            list.deinit(gpa);
+        }
+        var it = std.mem.splitScalar(u8, raw, ',');
+        while (it.next()) |raw_entry| {
+            const entry = std.mem.trim(u8, raw_entry, " \t");
+            if (entry.len == 0) continue;
+            try list.append(gpa, try gpa.dupe(u8, entry));
+        }
+        return list.toOwnedSlice(gpa);
+    }
+
+    /// Frees a slice allocated by `parseNoProxyList()` or `noProxyFromEnv()`.
+    pub fn freeNoProxyList(gpa: Allocator, list: [][]u8) void {
+        for (list) |e| gpa.free(e);
+        if (list.len > 0) gpa.free(list);
+    }
+
+    /// Parses `no_proxy` / `NO_PROXY` from `env_map` (prefers non-empty lowercase `no_proxy`).
+    pub fn noProxyFromEnv(gpa: Allocator, env_map: *const std.process.Environ.Map) Allocator.Error![][]u8 {
+        const raw = getNonEmptyEnv(env_map, &.{ "no_proxy", "NO_PROXY" }) orelse return &.{};
+        return parseNoProxyList(gpa, raw);
+    }
+
+    /// Parses the scheme-specific proxy environment variable without attaching `no_proxy`.
+    /// Prefers non-empty lowercase variables over uppercase, matching `curl` and `std.http.Client`:
+    /// - `.http`: `http_proxy`, `HTTP_PROXY`, `all_proxy`, `ALL_PROXY`
+    /// - `.https`: `https_proxy`, `HTTPS_PROXY`, `all_proxy`, `ALL_PROXY`
+    /// - `.http_unix`: always returns `null`
+    pub fn fromEnvNoBypass(
+        gpa: Allocator,
+        env_map: *const std.process.Environ.Map,
+        scheme: http.Scheme,
+    ) !?Owned {
+        const raw_url = switch (scheme) {
+            .https => getNonEmptyEnv(env_map, &.{ "https_proxy", "HTTPS_PROXY", "all_proxy", "ALL_PROXY" }),
+            .http => getNonEmptyEnv(env_map, &.{ "http_proxy", "HTTP_PROXY", "all_proxy", "ALL_PROXY" }),
+            .http_unix => return null,
+        } orelse return null;
+
+        return try parse(gpa, raw_url);
+    }
+
+    /// Parses standard proxy environment variables (`http_proxy`/`HTTP_PROXY` or
+    /// `https_proxy`/`HTTPS_PROXY`, plus `all_proxy`/`ALL_PROXY` and `no_proxy`/`NO_PROXY`)
+    /// from `env_map`.
+    /// Supports `http://`, `https://`, `socks5://`, and `socks5h://` proxy URLs.
+    /// Returns `null` if no non-empty proxy variable is set for `scheme`.
+    pub fn fromEnv(
+        gpa: Allocator,
+        env_map: *const std.process.Environ.Map,
+        scheme: http.Scheme,
+    ) !?Owned {
+        var owned = (try fromEnvNoBypass(gpa, env_map, scheme)) orelse return null;
+        errdefer owned.deinit(gpa);
+
+        owned.no_proxy_entries = try noProxyFromEnv(gpa, env_map);
+        return owned;
+    }
+
+    /// Returns true if `target_origin` matches any rule in `rules`.
+    /// Supports `*`, exact host, `.suffix`, `*.suffix` (subdomains only),
+    /// FQDN trailing dot, `host:port`, `[ipv6]:port`, canonical IPv4/IPv6 literals,
+    /// and IPv4/IPv6 CIDR blocks (`127.0.0.0/8`, `fe80::/10`, etc.).
     /// Unix domain socket origins always bypass proxies.
-    pub fn bypasses(self: ProxyConfig, target_origin: http.Origin) bool {
+    pub fn matchesNoProxy(rules: []const []const u8, target_origin: http.Origin) bool {
         if (target_origin.scheme == .http_unix) return true;
-        for (self.no_proxy) |raw_rule| {
+        if (rules.len == 0) return false;
+
+        const target_host = std.mem.trimEnd(u8, target_origin.host, ".");
+        if (target_host.len == 0) return false;
+
+        const target_ip: ?zio.net.IpAddress = zio.net.IpAddress.parseIp(target_host, 0) catch null;
+
+        for (rules) |raw_rule| {
             const rule = std.mem.trim(u8, raw_rule, " \t");
             if (rule.len == 0) continue;
             if (std.mem.eql(u8, rule, "*")) return true;
 
             var rule_host = rule;
             var rule_port: ?u16 = null;
+            var cidr_prefix: ?u8 = null;
+
             if (rule[0] == '[') {
-                if (std.mem.findScalar(u8, rule, ']')) |end_bracket| {
-                    rule_host = rule[1..end_bracket];
-                    if (end_bracket + 1 < rule.len and rule[end_bracket + 1] == ':') {
-                        rule_port = std.fmt.parseInt(u16, rule[end_bracket + 2 ..], 10) catch continue;
+                const end_bracket = std.mem.findScalar(u8, rule, ']') orelse continue;
+                rule_host = rule[1..end_bracket];
+                const rest = rule[end_bracket + 1 ..];
+                if (rest.len > 0) {
+                    if (rest[0] == ':') {
+                        rule_port = std.fmt.parseInt(u16, rest[1..], 10) catch continue;
+                    } else if (rest[0] == '/') {
+                        cidr_prefix = std.fmt.parseInt(u8, rest[1..], 10) catch continue;
+                    } else {
+                        continue;
                     }
                 }
+            } else if (std.mem.findScalar(u8, rule, '/')) |slash| {
+                rule_host = rule[0..slash];
+                cidr_prefix = std.fmt.parseInt(u8, rule[slash + 1 ..], 10) catch continue;
             } else if (std.mem.findScalarLast(u8, rule, ':')) |colon| {
                 if (std.mem.findScalar(u8, rule[0..colon], ':') == null) {
                     rule_host = rule[0..colon];
@@ -364,20 +450,106 @@ pub const ProxyConfig = struct {
                 if (p != target_origin.port) continue;
             }
 
-            const suffix = if (rule_host.len > 0 and rule_host[0] == '.') rule_host[1..] else rule_host;
+            if (cidr_prefix) |prefix| {
+                const t_ip = target_ip orelse continue;
+                const net_ip = zio.net.IpAddress.parseIp(rule_host, 0) catch continue;
+                if (ipMatchesCidr(t_ip, net_ip, prefix)) return true;
+                continue;
+            }
+
+            if (zio.net.IpAddress.parseIp(rule_host, 0)) |rule_ip| {
+                if (target_ip) |t_ip| {
+                    if (ipEqual(t_ip, rule_ip)) return true;
+                }
+                continue;
+            } else |_| {}
+
+            // Never apply hostname suffix matching against a literal IP target
+            // (prevents e.g. rule "0.0.1" from matching IP "127.0.0.1").
+            if (target_ip != null) continue;
+
+            const normalized_rule = std.mem.trimEnd(u8, rule_host, ".");
+            if (normalized_rule.len == 0) continue;
+
+            if (std.mem.startsWith(u8, normalized_rule, "*.")) {
+                const suffix = normalized_rule[2..];
+                if (suffix.len == 0) continue;
+                if (target_host.len > suffix.len) {
+                    const prefix_len = target_host.len - suffix.len;
+                    if (target_host[prefix_len - 1] == '.' and
+                        std.ascii.eqlIgnoreCase(target_host[prefix_len..], suffix))
+                    {
+                        return true;
+                    }
+                }
+                continue;
+            }
+
+            const suffix = if (normalized_rule[0] == '.') normalized_rule[1..] else normalized_rule;
             if (suffix.len == 0) continue;
 
-            if (std.ascii.eqlIgnoreCase(target_origin.host, suffix)) return true;
-            if (target_origin.host.len > suffix.len) {
-                const prefix_len = target_origin.host.len - suffix.len;
-                if (target_origin.host[prefix_len - 1] == '.' and
-                    std.ascii.eqlIgnoreCase(target_origin.host[prefix_len..], suffix))
+            if (std.ascii.eqlIgnoreCase(target_host, suffix)) return true;
+            if (target_host.len > suffix.len) {
+                const prefix_len = target_host.len - suffix.len;
+                if (target_host[prefix_len - 1] == '.' and
+                    std.ascii.eqlIgnoreCase(target_host[prefix_len..], suffix))
                 {
                     return true;
                 }
             }
         }
         return false;
+    }
+
+    /// Returns true if `target_origin` matches any rule in `self.no_proxy` and should connect directly.
+    /// Unix domain socket origins always bypass proxies.
+    pub fn bypasses(self: ProxyConfig, target_origin: http.Origin) bool {
+        return matchesNoProxy(self.no_proxy, target_origin);
+    }
+
+    fn getNonEmptyEnv(env_map: *const std.process.Environ.Map, names: []const []const u8) ?[]const u8 {
+        for (names) |name| {
+            const raw = env_map.get(name) orelse continue;
+            const trimmed = std.mem.trim(u8, raw, " \t");
+            if (trimmed.len > 0) return trimmed;
+        }
+        return null;
+    }
+
+    fn ipEqual(a: zio.net.IpAddress, b: zio.net.IpAddress) bool {
+        const fam = a.getFamily();
+        if (fam != b.getFamily()) return false;
+        return switch (fam) {
+            .ipv4 => a.in.addr == b.in.addr,
+            .ipv6 => std.mem.eql(u8, &a.in6.addr, &b.in6.addr),
+        };
+    }
+
+    fn ipMatchesCidr(target: zio.net.IpAddress, net: zio.net.IpAddress, prefix: u8) bool {
+        const fam = target.getFamily();
+        if (fam != net.getFamily()) return false;
+        return switch (fam) {
+            .ipv4 => {
+                if (prefix > 32) return false;
+                if (prefix == 0) return true;
+                const t_bytes: [4]u8 = @bitCast(target.in.addr);
+                const n_bytes: [4]u8 = @bitCast(net.in.addr);
+                const t = std.mem.readInt(u32, &t_bytes, .big);
+                const n = std.mem.readInt(u32, &n_bytes, .big);
+                const shift: u5 = @intCast(32 - prefix);
+                const mask: u32 = (~@as(u32, 0)) << shift;
+                return (t & mask) == (n & mask);
+            },
+            .ipv6 => {
+                if (prefix > 128) return false;
+                if (prefix == 0) return true;
+                const t = std.mem.readInt(u128, &target.in6.addr, .big);
+                const n = std.mem.readInt(u128, &net.in6.addr, .big);
+                const shift: u7 = @intCast(128 - prefix);
+                const mask: u128 = (~@as(u128, 0)) << shift;
+                return (t & mask) == (n & mask);
+            },
+        };
     }
 };
 
@@ -2356,4 +2528,158 @@ test "HTTPS TLS-to-proxy initiates TLS ClientHello to proxy for both HTTP and HT
     );
 
     try std.testing.expectEqual(@as(u32, 2), probe.saw_client_hello.load(.acquire));
+}
+
+test "ProxyConfig.parse, fromEnv precedence/empty fallback, NO_PROXY CIDR/wildcard/IPv6, and resolve" {
+    const gpa = std.testing.allocator;
+
+    // 1. ProxyConfig.parse: bare host:port, IPv6, percent-encoded credentials, password-only, invalid inputs
+    {
+        var bare = try ProxyConfig.parse(gpa, " 127.0.0.1:9988 ");
+        defer bare.deinit(gpa);
+        const cfg = bare.config();
+        try std.testing.expectEqual(ProxyConfig.Scheme.http, cfg.scheme);
+        try std.testing.expectEqualStrings("127.0.0.1", cfg.host);
+        try std.testing.expectEqual(@as(u16, 9988), cfg.port);
+
+        var v6 = try ProxyConfig.parse(gpa, "[::1]:8080");
+        defer v6.deinit(gpa);
+        try std.testing.expectEqualStrings("::1", v6.config().host);
+        try std.testing.expectEqual(@as(u16, 8080), v6.config().port);
+
+        var cred = try ProxyConfig.parse(gpa, "http://user%40corp:p%3Ass@PROXY.LOCAL:3128/");
+        defer cred.deinit(gpa);
+        try std.testing.expectEqualStrings("proxy.local", cred.config().host);
+        // base64("user@corp:p:ss") == "dXNlckBjb3JwOnA6c3M="
+        try std.testing.expectEqualStrings("Basic dXNlckBjb3JwOnA6c3M=", cred.config().authorization.?);
+
+        var pass_only = try ProxyConfig.parse(gpa, "http://:secret@proxy.local:3128");
+        defer pass_only.deinit(gpa);
+        // base64(":secret") == "OnNlY3JldA=="
+        try std.testing.expectEqualStrings("Basic OnNlY3JldA==", pass_only.config().authorization.?);
+
+        try std.testing.expectError(error.MissingHost, ProxyConfig.parse(gpa, "   "));
+        try std.testing.expectError(error.UnsupportedProxyScheme, ProxyConfig.parse(gpa, "ftp://proxy.local:21"));
+    }
+
+    // 2. fromEnv precedence: lowercase beats uppercase, empty values fall through, HTTP_PROXY doesn't apply to https
+    {
+        var env_map: std.process.Environ.Map = .init(gpa);
+        defer env_map.deinit();
+        try env_map.put("HTTP_PROXY", "http://upper-http:8080");
+        try env_map.put("http_proxy", "http://lower-http:8081");
+        try env_map.put("HTTPS_PROXY", "   ");
+        try env_map.put("all_proxy", "socks5h://fallback-all:1080");
+        try env_map.put("no_proxy", "   ");
+        try env_map.put("NO_PROXY", "localhost, 127.0.0.0/8");
+
+        var http_owned = (try ProxyConfig.fromEnv(gpa, &env_map, .http)).?;
+        defer http_owned.deinit(gpa);
+        try std.testing.expectEqualStrings("lower-http", http_owned.config().host);
+        try std.testing.expectEqual(@as(u16, 8081), http_owned.config().port);
+        try std.testing.expect(http_owned.config().bypasses(.{ .scheme = .http, .host = "127.0.0.42", .port = 80 }));
+
+        // Whitespace-only HTTPS_PROXY falls through to all_proxy.
+        var https_owned = (try ProxyConfig.fromEnv(gpa, &env_map, .https)).?;
+        defer https_owned.deinit(gpa);
+        try std.testing.expectEqual(ProxyConfig.Scheme.socks5h, https_owned.config().scheme);
+        try std.testing.expectEqualStrings("fallback-all", https_owned.config().host);
+    }
+
+    {
+        // Only HTTP_PROXY set -> .https returns null (does NOT borrow HTTP_PROXY).
+        var env_map: std.process.Environ.Map = .init(gpa);
+        defer env_map.deinit();
+        try env_map.put("HTTP_PROXY", "http://127.0.0.1:9988");
+
+        try std.testing.expectEqual(@as(?ProxyConfig.Owned, null), try ProxyConfig.fromEnv(gpa, &env_map, .https));
+        var http_owned = (try ProxyConfig.fromEnv(gpa, &env_map, .http)).?;
+        defer http_owned.deinit(gpa);
+        try std.testing.expectEqual(@as(u16, 9988), http_owned.config().port);
+    }
+
+    // 3. NO_PROXY matching: CIDR IPv4/IPv6, canonical IPv6, *.wildcard, FQDN trailing dot, no IP suffix false positive
+    {
+        const rules = &[_][]const u8{
+            "127.0.0.0/8",
+            "192.168.1.0/24",
+            "fe80::/10",
+            "[::1]:8080",
+            "::2",
+            "*.corp.local",
+            "example.com.",
+            "0.0.1",
+            "10.0.0.0/33", // invalid CIDR safely ignored
+        };
+
+        // IPv4 CIDR
+        try std.testing.expect(ProxyConfig.matchesNoProxy(rules, .{ .scheme = .http, .host = "127.0.0.1", .port = 80 }));
+        try std.testing.expect(ProxyConfig.matchesNoProxy(rules, .{ .scheme = .https, .host = "127.255.255.1", .port = 443 }));
+        try std.testing.expect(!ProxyConfig.matchesNoProxy(rules, .{ .scheme = .http, .host = "128.0.0.1", .port = 80 }));
+        try std.testing.expect(ProxyConfig.matchesNoProxy(rules, .{ .scheme = .http, .host = "192.168.1.42", .port = 80 }));
+        try std.testing.expect(!ProxyConfig.matchesNoProxy(rules, .{ .scheme = .http, .host = "192.168.2.42", .port = 80 }));
+
+        // IPv6 CIDR + canonical IPv6 equality + bracketed port
+        try std.testing.expect(ProxyConfig.matchesNoProxy(rules, .{ .scheme = .http, .host = "fe80::1", .port = 80 }));
+        try std.testing.expect(ProxyConfig.matchesNoProxy(rules, .{ .scheme = .http, .host = "febf::1234", .port = 80 }));
+        try std.testing.expect(!ProxyConfig.matchesNoProxy(rules, .{ .scheme = .http, .host = "fec0::1", .port = 80 }));
+        try std.testing.expect(ProxyConfig.matchesNoProxy(rules, .{ .scheme = .http, .host = "0:0:0:0:0:0:0:1", .port = 8080 }));
+        try std.testing.expect(!ProxyConfig.matchesNoProxy(rules, .{ .scheme = .http, .host = "::1", .port = 80 }));
+        try std.testing.expect(ProxyConfig.matchesNoProxy(rules, .{ .scheme = .http, .host = "0:0:0:0:0:0:0:2", .port = 9999 }));
+
+        // *.corp.local matches subdomains only, not bare corp.local
+        try std.testing.expect(ProxyConfig.matchesNoProxy(rules, .{ .scheme = .https, .host = "api.corp.local", .port = 443 }));
+        try std.testing.expect(ProxyConfig.matchesNoProxy(rules, .{ .scheme = .https, .host = "a.b.corp.local.", .port = 443 }));
+        try std.testing.expect(!ProxyConfig.matchesNoProxy(rules, .{ .scheme = .https, .host = "corp.local", .port = 443 }));
+        try std.testing.expect(!ProxyConfig.matchesNoProxy(rules, .{ .scheme = .https, .host = "notcorp.local", .port = 443 }));
+
+        // FQDN trailing dot normalization
+        try std.testing.expect(ProxyConfig.matchesNoProxy(rules, .{ .scheme = .https, .host = "example.com", .port = 443 }));
+        try std.testing.expect(ProxyConfig.matchesNoProxy(rules, .{ .scheme = .https, .host = "sub.example.com.", .port = 443 }));
+
+        // No IP suffix false positive ("0.0.1" must NOT suffix-match IPv4 literal "10.0.0.1")
+        try std.testing.expect(!ProxyConfig.matchesNoProxy(rules, .{ .scheme = .http, .host = "10.0.0.1", .port = 80 }));
+
+        // Zero-prefix CIDR (/0) safely matches all of same IP family without shift UB
+        try std.testing.expect(ProxyConfig.matchesNoProxy(&.{"0.0.0.0/0"}, .{ .scheme = .http, .host = "8.8.8.8", .port = 80 }));
+        try std.testing.expect(!ProxyConfig.matchesNoProxy(&.{"0.0.0.0/0"}, .{ .scheme = .http, .host = "2001:db8::1", .port = 80 }));
+        try std.testing.expect(ProxyConfig.matchesNoProxy(&.{"::/0"}, .{ .scheme = .http, .host = "2001:db8::1", .port = 80 }));
+    }
+
+    // 4. ProxyConfig.resolve: scheme routing + fallback + no_proxy
+    {
+        const p_http: ProxyConfig = .{ .host = "http-proxy", .port = 8080 };
+        const p_https: ProxyConfig = .{ .host = "https-proxy", .port = 8443 };
+        const p_all: ProxyConfig = .{ .scheme = .socks5h, .host = "all-proxy", .port = 1080 };
+
+        const r1 = ProxyConfig.resolve(.{ .scheme = .http, .host = "example.com", .port = 80 }, .{
+            .proxy = p_all,
+            .http_proxy = p_http,
+            .https_proxy = p_https,
+            .no_proxy = &.{"*.bypass.local"},
+        }).?;
+        try std.testing.expectEqualStrings("http-proxy", r1.host);
+
+        const r2 = ProxyConfig.resolve(.{ .scheme = .https, .host = "example.com", .port = 443 }, .{
+            .proxy = p_all,
+            .http_proxy = p_http,
+            .https_proxy = p_https,
+            .no_proxy = &.{"*.bypass.local"},
+        }).?;
+        try std.testing.expectEqualStrings("https-proxy", r2.host);
+
+        const r3 = ProxyConfig.resolve(.{ .scheme = .https, .host = "example.com", .port = 443 }, .{
+            .proxy = p_all,
+            .http_proxy = p_http,
+        }).?;
+        try std.testing.expectEqualStrings("all-proxy", r3.host);
+
+        try std.testing.expectEqual(
+            @as(?ProxyConfig, null),
+            ProxyConfig.resolve(.{ .scheme = .https, .host = "svc.bypass.local", .port = 443 }, .{
+                .https_proxy = p_https,
+                .no_proxy = &.{"*.bypass.local"},
+            }),
+        );
+    }
 }

@@ -43,8 +43,15 @@ pub const Config = struct {
     max_conn_lifetime: ?zio.Duration = .fromSeconds(300),
     /// Optional TLS override; when `null`, verifies against the Pool's lazily loaded system CA store.
     tls: ?Connection.TlsConfig = null,
-    /// Optional HTTP / HTTPS forward proxy configuration.
+    /// Optional fallback proxy applied to both `http://` and `https://` targets
+    /// when no scheme-specific `http_proxy` / `https_proxy` is set (equivalent to `ALL_PROXY`).
     proxy: ?Connection.ProxyConfig = null,
+    /// Optional proxy specifically for `http://` (and `ws://`) targets (overrides `proxy`).
+    http_proxy: ?Connection.ProxyConfig = null,
+    /// Optional proxy specifically for `https://` (and `wss://`) targets (overrides `proxy`).
+    https_proxy: ?Connection.ProxyConfig = null,
+    /// Optional global `no_proxy` bypass rules applied in addition to any per-proxy `ProxyConfig.no_proxy`.
+    no_proxy: []const []const u8 = &.{},
     /// Optional Unix domain socket path that routes all plain HTTP requests
     /// through a local socket while preserving logical URL `Host` headers.
     unix_socket_path: ?[]const u8 = null,
@@ -107,6 +114,10 @@ total_idle: usize = 0,
 total_waiters: usize = 0,
 closed: bool = false,
 closed_cond: zio.Condition = .init,
+owned_proxy: ?Connection.ProxyConfig.Owned = null,
+owned_http_proxy: ?Connection.ProxyConfig.Owned = null,
+owned_https_proxy: ?Connection.ProxyConfig.Owned = null,
+owned_no_proxy: [][]u8 = &.{},
 
 pub fn init(gpa: Allocator, io: std.Io, config: Config) Pool {
     return .{
@@ -114,6 +125,155 @@ pub fn init(gpa: Allocator, io: std.Io, config: Config) Pool {
         .io = io,
         .config = config,
     };
+}
+
+/// Populates unset proxy settings from standard environment variables in `env_map`:
+/// - `http_proxy` / `HTTP_PROXY` (falling back to `all_proxy` / `ALL_PROXY`) -> `http_proxy`
+/// - `https_proxy` / `HTTPS_PROXY` (falling back to `all_proxy` / `ALL_PROXY`) -> `https_proxy`
+/// - `no_proxy` / `NO_PROXY` -> `no_proxy`
+///
+/// Preserves any proxy or `no_proxy` already configured explicitly on this `Pool`.
+/// Owned allocations are automatically freed by `Pool.deinit()`.
+/// Asserts that no requests are currently in flight; any idle connections are closed.
+pub fn initDefaultProxies(self: *Pool, env_map: *const std.process.Environ.Map) !void {
+    self.assertNoInFlightAndDrainIdle();
+
+    const want_http = self.config.http_proxy == null and self.config.proxy == null;
+    const want_https = self.config.https_proxy == null and self.config.proxy == null;
+    const want_no_proxy = self.config.no_proxy.len == 0;
+
+    var new_http: ?Connection.ProxyConfig.Owned = if (want_http)
+        try Connection.ProxyConfig.fromEnvNoBypass(self.gpa, env_map, .http)
+    else
+        null;
+    errdefer if (new_http) |*p| p.deinit(self.gpa);
+
+    var new_https: ?Connection.ProxyConfig.Owned = if (want_https)
+        try Connection.ProxyConfig.fromEnvNoBypass(self.gpa, env_map, .https)
+    else
+        null;
+    errdefer if (new_https) |*p| p.deinit(self.gpa);
+
+    const new_no_proxy: [][]u8 = if (want_no_proxy)
+        try Connection.ProxyConfig.noProxyFromEnv(self.gpa, env_map)
+    else
+        &.{};
+    errdefer Connection.ProxyConfig.freeNoProxyList(self.gpa, new_no_proxy);
+
+    if (new_http) |p| {
+        if (self.owned_http_proxy) |*old| old.deinit(self.gpa);
+        self.owned_http_proxy = p;
+        self.config.http_proxy = self.owned_http_proxy.?.config();
+    }
+    if (new_https) |p| {
+        if (self.owned_https_proxy) |*old| old.deinit(self.gpa);
+        self.owned_https_proxy = p;
+        self.config.https_proxy = self.owned_https_proxy.?.config();
+    }
+    if (new_no_proxy.len > 0) {
+        Connection.ProxyConfig.freeNoProxyList(self.gpa, self.owned_no_proxy);
+        self.owned_no_proxy = new_no_proxy;
+        self.config.no_proxy = self.owned_no_proxy;
+    }
+}
+
+/// Parses `raw_url` (e.g. `"http://user:pass@127.0.0.1:9988"`, `"socks5h://127.0.0.1:1080"`)
+/// and installs it as the fallback proxy (`config.proxy`) for both `http://` and `https://`.
+/// Owned memory is freed automatically by `Pool.deinit()`.
+/// Asserts that no requests are currently in flight; any idle connections are closed.
+pub fn setProxy(self: *Pool, raw_url: []const u8) !void {
+    self.assertNoInFlightAndDrainIdle();
+    const parsed = try Connection.ProxyConfig.parse(self.gpa, raw_url);
+    if (self.owned_proxy) |*old| old.deinit(self.gpa);
+    self.owned_proxy = parsed;
+    self.config.proxy = self.owned_proxy.?.config();
+}
+
+/// Parses `raw_url` and installs it as the `http://` (and `ws://`) proxy (`config.http_proxy`).
+/// Owned memory is freed automatically by `Pool.deinit()`.
+/// Asserts that no requests are currently in flight; any idle connections are closed.
+pub fn setHttpProxy(self: *Pool, raw_url: []const u8) !void {
+    self.assertNoInFlightAndDrainIdle();
+    const parsed = try Connection.ProxyConfig.parse(self.gpa, raw_url);
+    if (self.owned_http_proxy) |*old| old.deinit(self.gpa);
+    self.owned_http_proxy = parsed;
+    self.config.http_proxy = self.owned_http_proxy.?.config();
+}
+
+/// Parses `raw_url` and installs it as the `https://` (and `wss://`) proxy (`config.https_proxy`).
+/// Owned memory is freed automatically by `Pool.deinit()`.
+/// Asserts that no requests are currently in flight; any idle connections are closed.
+pub fn setHttpsProxy(self: *Pool, raw_url: []const u8) !void {
+    self.assertNoInFlightAndDrainIdle();
+    const parsed = try Connection.ProxyConfig.parse(self.gpa, raw_url);
+    if (self.owned_https_proxy) |*old| old.deinit(self.gpa);
+    self.owned_https_proxy = parsed;
+    self.config.https_proxy = self.owned_https_proxy.?.config();
+}
+
+/// Parses a comma-separated `NO_PROXY` rule list (e.g. `"localhost, 127.0.0.0/8, .internal.corp"`)
+/// and installs it as `config.no_proxy`.
+/// Owned memory is freed automatically by `Pool.deinit()`.
+/// Asserts that no requests are currently in flight; any idle connections are closed.
+pub fn setNoProxy(self: *Pool, raw_list: []const u8) Allocator.Error!void {
+    self.assertNoInFlightAndDrainIdle();
+    const parsed = try Connection.ProxyConfig.parseNoProxyList(self.gpa, raw_list);
+    Connection.ProxyConfig.freeNoProxyList(self.gpa, self.owned_no_proxy);
+    self.owned_no_proxy = parsed;
+    self.config.no_proxy = self.owned_no_proxy;
+}
+
+/// Resolves the effective proxy for `target_origin` honoring `unix_socket_path`,
+/// scheme-specific `http_proxy` / `https_proxy`, fallback `proxy`, and `no_proxy` rules.
+pub fn resolveProxy(self: *const Pool, target_origin: http.Origin) ?Connection.ProxyConfig {
+    if (self.config.unix_socket_path != null) return null;
+    return Connection.ProxyConfig.resolve(target_origin, .{
+        .proxy = self.config.proxy,
+        .http_proxy = self.config.http_proxy,
+        .https_proxy = self.config.https_proxy,
+        .no_proxy = self.config.no_proxy,
+    });
+}
+
+fn assertNoInFlightAndDrainIdle(self: *Pool) void {
+    var to_destroy: std.DoublyLinkedList = .{};
+    defer destroyList(self.gpa, &to_destroy);
+
+    self.mutex.lockUncancelable();
+    var it = self.buckets.valueIterator();
+    while (it.next()) |bucket_ptr| {
+        assert(bucket_ptr.*.in_flight == 0);
+    }
+
+    while (self.global_idle.popFirst()) |node| {
+        const conn = connFromGlobalNode(node);
+        if (self.buckets.get(conn.origin())) |bucket| {
+            bucket.idle.remove(&conn.origin_node);
+            bucket.idle_count -= 1;
+        }
+        self.total_idle -= 1;
+        to_destroy.append(&conn.global_idle_node);
+    }
+    self.mutex.unlock();
+}
+
+fn freeOwnedProxies(self: *Pool) void {
+    if (self.owned_proxy) |*p| {
+        p.deinit(self.gpa);
+        self.owned_proxy = null;
+    }
+    if (self.owned_http_proxy) |*p| {
+        p.deinit(self.gpa);
+        self.owned_http_proxy = null;
+    }
+    if (self.owned_https_proxy) |*p| {
+        p.deinit(self.gpa);
+        self.owned_https_proxy = null;
+    }
+    if (self.owned_no_proxy.len > 0) {
+        Connection.ProxyConfig.freeNoProxyList(self.gpa, self.owned_no_proxy);
+        self.owned_no_proxy = &.{};
+    }
 }
 
 /// Spawns a cooperative background task that calls `pruneExpired()` every `interval`.
@@ -203,6 +363,7 @@ pub fn deinit(self: *Pool) void {
     self.mutex.unlock();
 
     self.ca_store.deinit(self.gpa);
+    self.freeOwnedProxies();
 }
 
 /// Returns a `Transport` fat-pointer backed by this `Pool`.
@@ -260,11 +421,11 @@ pub fn stats(self: *Pool) Stats {
     };
 }
 
-fn connectOptions(self: *Pool) Connection.ConnectOptions {
+fn connectOptions(self: *Pool, target_origin: http.Origin) Connection.ConnectOptions {
     return .{
         .io = self.io,
         .tls = self.config.tls orelse .{ .system = &self.ca_store },
-        .proxy = self.config.proxy,
+        .proxy = self.resolveProxy(target_origin),
         .unix_socket_path = self.config.unix_socket_path,
         .address_filter = self.config.address_filter,
         .read_buffer_size = self.config.read_buffer_size,
@@ -273,9 +434,9 @@ fn connectOptions(self: *Pool) Connection.ConnectOptions {
 }
 
 fn bucketOriginFor(self: *const Pool, target_origin: http.Origin) http.Origin {
-    if (self.config.unix_socket_path == null and target_origin.scheme == .http) {
-        if (self.config.proxy) |p| {
-            if (!p.scheme.isSocks5() and !p.bypasses(target_origin)) {
+    if (target_origin.scheme == .http) {
+        if (self.resolveProxy(target_origin)) |p| {
+            if (!p.scheme.isSocks5()) {
                 return .{
                     .scheme = if (p.scheme == .https) .https else .http,
                     .host = p.host,
@@ -369,7 +530,7 @@ fn acquireConnectionInner(self: *Pool, target_origin: http.Origin, skip_idle: bo
     // Close any expired connections before dialing so fds are freed promptly.
     destroyList(self.gpa, &expired);
 
-    const conn = Connection.connect(self.gpa, target_origin, self.connectOptions()) catch |err| {
+    const conn = Connection.connect(self.gpa, target_origin, self.connectOptions(target_origin)) catch |err| {
         self.releaseSlotUncancelable(bucket);
         return err;
     };
@@ -581,13 +742,7 @@ const PoolExchange = struct {
         }
 
         const framing = req.body.toRequestFraming();
-        const active_proxy: ?Connection.ProxyConfig = if (pool.config.unix_socket_path == null)
-            if (pool.config.proxy) |p|
-                if (p.bypasses(req.origin)) null else p
-            else
-                null
-        else
-            null;
+        const active_proxy: ?Connection.ProxyConfig = pool.resolveProxy(req.origin);
         const use_plain_proxy = active_proxy != null and
             !active_proxy.?.scheme.isSocks5() and
             req.origin.scheme == .http;

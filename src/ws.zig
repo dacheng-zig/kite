@@ -349,8 +349,14 @@ pub const ConnectOptions = struct {
     compression_min_bytes: usize = 64,
     /// Optional TLS configuration (`null` uses system root CAs or the parent `Client`'s config).
     tls: ?Connection.TlsConfig = null,
-    /// Optional proxy configuration (HTTP CONNECT, HTTPS proxy, or SOCKS5/SOCKS5h).
+    /// Optional fallback proxy configuration (`http://`, `https://`, `socks5://`, `socks5h://`).
     proxy: ?Connection.ProxyConfig = null,
+    /// Optional proxy specifically for `ws://` targets (overrides `proxy`).
+    http_proxy: ?Connection.ProxyConfig = null,
+    /// Optional proxy specifically for `wss://` targets (overrides `proxy`).
+    https_proxy: ?Connection.ProxyConfig = null,
+    /// Optional `no_proxy` bypass rules applied in addition to per-proxy `ProxyConfig.no_proxy`.
+    no_proxy: []const []const u8 = &.{},
     /// Optional Unix domain socket path override.
     unix_socket_path: ?[]const u8 = null,
     /// Optional post-DNS IP address filter (SSRF protection).
@@ -418,13 +424,19 @@ pub const Conn = struct {
     /// unless explicitly overridden in `opts`.
     pub fn connectWithClient(client: *Client, opts: ConnectOptions) !Conn {
         var effective = opts;
-        if (effective.proxy == null) effective.proxy = client.config.pool.proxy;
-        if (effective.unix_socket_path == null) effective.unix_socket_path = client.config.pool.unix_socket_path;
-        if (effective.address_filter == null) effective.address_filter = client.config.pool.address_filter;
+        const explicit_proxy_override = opts.proxy != null or opts.http_proxy != null or opts.https_proxy != null;
+        if (!explicit_proxy_override) {
+            effective.proxy = client.pool.config.proxy;
+            effective.http_proxy = client.pool.config.http_proxy;
+            effective.https_proxy = client.pool.config.https_proxy;
+        }
+        if (effective.no_proxy.len == 0) effective.no_proxy = client.pool.config.no_proxy;
+        if (effective.unix_socket_path == null) effective.unix_socket_path = client.pool.config.unix_socket_path;
+        if (effective.address_filter == null) effective.address_filter = client.pool.config.address_filter;
         if (effective.cookie_jar == null) effective.cookie_jar = client.config.cookie_jar;
         if (effective.user_agent == null) effective.user_agent = client.config.user_agent;
 
-        const tls_cfg = effective.tls orelse client.config.pool.tls orelse Connection.TlsConfig{ .system = &client.pool.ca_store };
+        const tls_cfg = effective.tls orelse client.pool.config.tls orelse Connection.TlsConfig{ .system = &client.pool.ca_store };
         return connectInternal(client.gpa, client.pool.io, effective, tls_cfg);
     }
 
@@ -799,13 +811,23 @@ fn connectInternal(
         const origin = try parseWsOrigin(parsed.uri, &host_buf);
         const target = try extractTarget(current_url);
 
+        const active_proxy = if (opts.unix_socket_path == null)
+            Connection.ProxyConfig.resolve(origin, .{
+                .proxy = opts.proxy,
+                .http_proxy = opts.http_proxy,
+                .https_proxy = opts.https_proxy,
+                .no_proxy = opts.no_proxy,
+            })
+        else
+            null;
+
         const conn = try zio.withTimeout(opts.connect_timeout, Connection.connect, .{
             gpa,
             origin,
             Connection.ConnectOptions{
                 .io = io,
                 .tls = tls_cfg,
-                .proxy = opts.proxy,
+                .proxy = active_proxy,
                 .unix_socket_path = opts.unix_socket_path,
                 .address_filter = opts.address_filter,
                 .force_connect_tunnel = true,
@@ -1633,4 +1655,74 @@ test "ws.Conn diagnostics (rejected_status), read_idle_timeout, invalid Accept k
         const msg = (try c.readMessage()).?;
         try std.testing.expectEqualStrings("redirected-ok", msg.payload);
     }
+}
+
+test "WebSocket connectWithClient inherits client.initDefaultProxies scheme routing and NO_PROXY" {
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+
+    const WsProxyStub = struct {
+        connect_hits: std.atomic.Value(u32) = .init(0),
+
+        fn handle(ctx: ?*anyopaque, stream: zio.net.Stream) void {
+            const self: *@This() = @ptrCast(@alignCast(ctx.?));
+            var rbuf: [1024]u8 = undefined;
+            var wbuf: [1024]u8 = undefined;
+            var sr = stream.reader(&rbuf);
+            var sw = stream.writer(&wbuf);
+
+            const req_line = sr.interface.takeDelimiterInclusive('\n') catch return;
+            while (true) {
+                const line = sr.interface.takeDelimiterInclusive('\n') catch return;
+                if (std.mem.eql(u8, line, "\r\n")) break;
+            }
+            if (std.mem.startsWith(u8, req_line, "CONNECT ")) {
+                _ = self.connect_hits.fetchAdd(1, .acq_rel);
+                sw.interface.writeAll(
+                    "HTTP/1.1 407 Proxy Authentication Required\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                ) catch return;
+                sw.interface.flush() catch return;
+            }
+        }
+    };
+
+    var http_proxy_st: WsProxyStub = .{};
+    var https_proxy_st: WsProxyStub = .{};
+
+    var http_proxy_srv: MockServer = undefined;
+    try http_proxy_srv.start(&http_proxy_st, WsProxyStub.handle);
+    defer http_proxy_srv.stop();
+
+    var https_proxy_srv: MockServer = undefined;
+    try https_proxy_srv.start(&https_proxy_st, WsProxyStub.handle);
+    defer https_proxy_srv.stop();
+
+    const http_proxy_url = try gpa.print("http://127.0.0.1:{d}", .{http_proxy_srv.port()});
+    defer gpa.free(http_proxy_url);
+    const https_proxy_url = try gpa.print("http://127.0.0.1:{d}", .{https_proxy_srv.port()});
+    defer gpa.free(https_proxy_url);
+
+    var env_map: std.process.Environ.Map = .init(gpa);
+    defer env_map.deinit();
+    try env_map.put("HTTP_PROXY", http_proxy_url);
+    try env_map.put("HTTPS_PROXY", https_proxy_url);
+
+    var client = Client.init(gpa, rt.io(), .{});
+    defer client.deinit();
+    try client.initDefaultProxies(&env_map);
+
+    // ws:// routes to HTTP_PROXY
+    try std.testing.expectError(
+        error.ProxyAuthRequired,
+        Conn.connectWithClient(&client, .{ .url = "ws://ws-target.example/chat" }),
+    );
+    // wss:// routes to HTTPS_PROXY
+    try std.testing.expectError(
+        error.ProxyAuthRequired,
+        Conn.connectWithClient(&client, .{ .url = "wss://wss-target.example/chat" }),
+    );
+
+    try std.testing.expectEqual(@as(u32, 1), http_proxy_st.connect_hits.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 1), https_proxy_st.connect_hits.load(.acquire));
 }

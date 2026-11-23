@@ -25,7 +25,7 @@ Compared to using `std.http.Client` directly in Zig 0.17, Kite focuses on **prod
   - `ws`: RFC 6455 + RFC 7692 (`permessage-deflate` with heap-pinned workspace & Zip Bomb cap) full-duplex WebSocket client (`ws://` / `wss://` / `ws+unix://`, HTTP/1.1 `101` upgrade with leftover-byte preservation, subprotocol & redirect support, fragmented UTF-8 reassembly, `sendFragmented`, `read_idle_timeout`, interleaved Ping/auto-Pong, concurrent write mutex, IANA Close codes & handshake).
   - `CookieJar`: coroutine-safe, domain-indexed RFC 6265 cookies (`O(labels)` lookup) with host-only isolation, `Secure` gating, `Max-Age` precedence, capacity limits, public-suffix blocking + `is_public_suffix` hook, inspect/remove API, and JSON persistence (`exportJsonAlloc` / `importJson`).
   - `multipart`: in-memory `Builder` and constant-memory `StreamWriter` (RFC 7578) for multi-GB uploads.
-  - **Proxy, Unix Sockets & Observability**: HTTP forward proxy (`http://`), HTTPS TLS-to-proxy (`https://`, incl. double-TLS `CONNECT` tunnel), SOCKS5 / SOCKS5h (`socks5://` / `socks5h://` with RFC 1929 auth & remote DNS), `NO_PROXY` + `ProxyConfig.fromEnv()`, Unix domain sockets (`http+unix://` & `Pool.Config.unix_socket_path`), plus zero-allocation `Trace` timing hooks (`dns_ns` / `tcp_ns` / `tls_ns` / `connect_ns` / `ttfb_ns` / `total_ns` / `reused_connection`).
+  - **Proxy, Unix Sockets & Observability**: HTTP forward proxy (`http://`), HTTPS TLS-to-proxy (`https://`, incl. double-TLS `CONNECT` tunnel), SOCKS5 / SOCKS5h (`socks5://` / `socks5h://` with RFC 1929 auth & remote DNS), scheme-aware `http_proxy` / `https_proxy` / `all_proxy` / `no_proxy` (CIDR, `*.` wildcard, IPv6, `host:port`) with explicit `client.initDefaultProxies(init.environ_map)` & `client.setProxy(...)` helpers, Unix domain sockets (`http+unix://` & `Pool.Config.unix_socket_path`), plus zero-allocation `Trace` timing hooks (`dns_ns` / `tcp_ns` / `tls_ns` / `connect_ns` / `ttfb_ns` / `total_ns` / `reused_connection`).
 
 ## Installation
 
@@ -58,6 +58,8 @@ pub fn main(init: std.process.Init) !void {
 
     var client = kite.Client.init(init.gpa, rt.io(), .{});
     defer client.deinit();
+    // Optional explicit opt-in to HTTP_PROXY / HTTPS_PROXY / ALL_PROXY / NO_PROXY:
+    // try client.initDefaultProxies(init.environ_map);
 
     var res = try client.get("https://example.com");
     defer res.deinit();
@@ -68,7 +70,7 @@ pub fn main(init: std.process.Init) !void {
 
 ## Examples
 
-Run `zig build test` for the full offline test suite (71 tests incl. `std.testing.fuzz` & 48-coroutine concurrency stress, 0 memory leaks in Debug & ReleaseSafe), `zig build examples` to compile all examples, or run any example directly:
+Run `zig build test` for the full offline test suite (74 tests incl. `std.testing.fuzz` & 48-coroutine concurrency stress, 0 memory leaks in Debug & ReleaseSafe), `zig build examples` to compile all examples, or run any example directly:
 
 | Example | Command | Highlights |
 | --- | --- | --- |
