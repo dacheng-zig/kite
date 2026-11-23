@@ -11,8 +11,12 @@ pub const Transport = @import("Transport.zig");
 pub const Pool = @import("Pool.zig");
 pub const Client = @import("Client.zig");
 pub const RetryTransport = @import("RetryTransport.zig");
+pub const CacheTransport = @import("CacheTransport.zig");
+pub const CircuitBreakerTransport = @import("CircuitBreakerTransport.zig");
 pub const CookieJar = @import("CookieJar.zig");
 pub const multipart = @import("multipart.zig");
+pub const sse = @import("sse.zig");
+pub const ws = @import("ws.zig");
 
 pub const CaStore = Connection.CaStore;
 pub const TlsConfig = Connection.TlsConfig;

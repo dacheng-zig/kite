@@ -540,6 +540,12 @@ pub const PendingRequest = struct {
         var next_host_buf: [http.Origin.max_host_len]u8 = undefined;
         const next_origin = try http.Origin.fromUri(next_uri, &next_host_buf);
 
+        // Security invariant (I-UDS-2): never allow a network HTTP/HTTPS response to
+        // redirect into a local Unix domain socket (prevents SSRF -> local daemon escalation).
+        if (prev_origin.scheme != .http_unix and next_origin.scheme == .http_unix) {
+            return error.UnixSocketRedirectBlocked;
+        }
+
         if (self.check_redirect) |hook| {
             const decision = try hook.check(hook.ctx, .{
                 .status = status,
@@ -990,12 +996,16 @@ fn resolveRedirectUrl(gpa: Allocator, base: std.Uri, location: []const u8) ![]u8
 
     try out.writer.print("{s}://", .{resolved.scheme});
     if (resolved.host) |h| {
-        var hbuf: [http.Origin.max_host_len]u8 = undefined;
-        const host_raw = try h.toRaw(&hbuf);
-        if (std.mem.findScalar(u8, host_raw, ':') != null and host_raw[0] != '[') {
-            try out.writer.print("[{s}]", .{host_raw});
+        if (std.ascii.eqlIgnoreCase(resolved.scheme, "http+unix")) {
+            try out.writer.writeAll(h.percent_encoded);
         } else {
-            try out.writer.writeAll(host_raw);
+            var hbuf: [http.Origin.max_host_len]u8 = undefined;
+            const host_raw = try h.toRaw(&hbuf);
+            if (std.mem.findScalar(u8, host_raw, ':') != null and host_raw[0] != '[') {
+                try out.writer.print("[{s}]", .{host_raw});
+            } else {
+                try out.writer.writeAll(host_raw);
+            }
         }
     }
     if (resolved.port) |p| {
@@ -1608,5 +1618,142 @@ test "Client CheckRedirect, Location spaces, lazy deflate, decompressed header s
         defer req.deinit();
 
         try std.testing.expectError(error.Timeout, req.receiveHead());
+    }
+}
+
+test "Unix domain socket: http+unix URL, explicit unix_socket_path, Keep-Alive, and redirect security" {
+    if (!zio.net.has_unix_sockets) return error.SkipZigTest;
+
+    const gpa = std.testing.allocator;
+    const rt = try zio.Runtime.init(gpa, .{});
+    defer rt.deinit();
+
+    // Create a unique short path under /tmp (macOS sun_path max is 104 bytes).
+    var rand_bytes: [6]u8 = undefined;
+    try zio.randomSecure(&rand_bytes);
+    const hex = std.fmt.bytesToHex(rand_bytes, .lower);
+    var path_buf: [64]u8 = undefined;
+    const sock_path = try std.fmt.bufPrint(&path_buf, "/tmp/kite-uds-{s}.sock", .{hex});
+    std.Io.Dir.cwd().deleteFile(rt.io(), sock_path) catch {};
+    defer std.Io.Dir.cwd().deleteFile(rt.io(), sock_path) catch {};
+
+    const UdsServer = struct {
+        server: zio.net.Server,
+        group: zio.Group = .init,
+        stopped: std.atomic.Value(bool) = .init(false),
+        accepts: std.atomic.Value(u32) = .init(0),
+        requests: std.atomic.Value(u32) = .init(0),
+
+        fn acceptLoop(self: *@This()) void {
+            while (!self.stopped.load(.acquire)) {
+                const stream = self.server.accept(.{}) catch break;
+                _ = self.accepts.fetchAdd(1, .acq_rel);
+                self.group.spawn(handleConn, .{ self, stream }) catch stream.close();
+            }
+        }
+
+        fn handleConn(self: *@This(), stream: zio.net.Stream) void {
+            defer stream.close();
+            var rbuf: [1024]u8 = undefined;
+            var wbuf: [1024]u8 = undefined;
+            var sr = stream.reader(&rbuf);
+            var sw = stream.writer(&wbuf);
+
+            while (true) {
+                var host_buf: [128]u8 = undefined;
+                var host_len: usize = 0;
+                var first_line_seen = false;
+                while (true) {
+                    const line = sr.interface.takeDelimiterInclusive('\n') catch return;
+                    if (std.mem.eql(u8, line, "\r\n")) break;
+                    if (!first_line_seen) {
+                        first_line_seen = true;
+                        continue;
+                    }
+                    if (std.ascii.startsWithIgnoreCase(line, "host:")) {
+                        const v = std.mem.trim(u8, line[5..], " \t\r\n");
+                        host_len = @min(v.len, host_buf.len);
+                        @memcpy(host_buf[0..host_len], v[0..host_len]);
+                    }
+                }
+                _ = self.requests.fetchAdd(1, .acq_rel);
+                const host_val = host_buf[0..host_len];
+                sw.interface.print(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {d}\r\n\r\n{s}",
+                    .{ host_val.len, host_val },
+                ) catch return;
+                sw.interface.flush() catch return;
+            }
+        }
+    };
+
+    const addr = try zio.net.UnixAddress.init(sock_path);
+    var uds_srv: UdsServer = .{
+        .server = try addr.listen(.{}),
+    };
+    try uds_srv.group.spawn(UdsServer.acceptLoop, .{&uds_srv});
+    defer {
+        uds_srv.stopped.store(true, .release);
+        uds_srv.group.cancel();
+        uds_srv.server.close();
+    }
+
+    // 1. `http+unix://` URL routing bypasses configured proxy & reuses Keep-Alive socket.
+    {
+        var client = Client.init(gpa, rt.io(), .{
+            .pool = .{
+                // Deliberately unreachable proxy to prove UDS always bypasses proxies.
+                .proxy = .{ .host = "127.0.0.1", .port = 1 },
+            },
+        });
+        defer client.deinit();
+
+        const url = try gpa.print("http+unix://%2Ftmp%2Fkite-uds-{s}.sock/v1/ping", .{hex});
+        defer gpa.free(url);
+
+        var r1 = try client.get(url);
+        defer r1.deinit();
+        try std.testing.expectEqual(http.Status.ok, r1.status);
+        try std.testing.expectEqualStrings("localhost", r1.body);
+
+        var r2 = try client.get(url);
+        defer r2.deinit();
+        try std.testing.expectEqual(http.Status.ok, r2.status);
+        try std.testing.expectEqualStrings("localhost", r2.body);
+
+        // Reused the single UDS connection across both requests.
+        try std.testing.expectEqual(@as(u32, 1), uds_srv.accepts.load(.acquire));
+        try std.testing.expectEqual(@as(u32, 2), uds_srv.requests.load(.acquire));
+    }
+
+    // 2. Explicit `Pool.Config.unix_socket_path` preserves logical URL `Host` header.
+    {
+        var client = Client.init(gpa, rt.io(), .{
+            .pool = .{ .unix_socket_path = sock_path },
+        });
+        defer client.deinit();
+
+        var res = try client.get("http://docker.local/v1.43/info");
+        defer res.deinit();
+        try std.testing.expectEqual(http.Status.ok, res.status);
+        try std.testing.expectEqualStrings("docker.local", res.body);
+    }
+
+    // 3. Security invariant (I-UDS-2): network HTTP 302 redirecting to `http+unix://` MUST be blocked.
+    {
+        var mock: MockTransport = .init(gpa);
+        defer mock.deinit();
+        try mock.pushResponse(.{
+            .status = .found,
+            .headers = &.{.{ .name = "Location", .value = "http+unix://%2Fvar%2Frun%2Fdocker.sock/info" }},
+        });
+
+        var client = Client.initWithTransport(gpa, rt.io(), mock.transport(), .{});
+        defer client.deinit();
+
+        try std.testing.expectError(
+            error.UnixSocketRedirectBlocked,
+            client.get("http://untrusted.example/redirect"),
+        );
     }
 }

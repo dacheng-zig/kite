@@ -41,7 +41,11 @@ pub fn build(b: *std.Build) void {
         .{ .name = "example-transport", .path = "examples/custom_transport.zig", .desc = "Run custom Transport decorator + redirect/timeout example" },
         .{ .name = "example-retry", .path = "examples/retry_and_trace.zig", .desc = "Run RetryTransport + Trace observability example" },
         .{ .name = "example-cookies", .path = "examples/cookies.zig", .desc = "Run RFC 6265 CookieJar session & redirect example" },
-        .{ .name = "example-proxy", .path = "examples/proxy.zig", .desc = "Run HTTP forward proxy + Proxy-Authorization example" },
+        .{ .name = "example-proxy", .path = "examples/proxy.zig", .desc = "Run HTTP forward proxy + SOCKS5h proxy example" },
+        .{ .name = "example-sse", .path = "examples/sse.zig", .desc = "Run Server-Sent Events (SSE) streaming & reconnect example" },
+        .{ .name = "example-websocket", .path = "examples/websocket.zig", .desc = "Run full-duplex RFC 6455/7692 WebSocket example" },
+        .{ .name = "example-middleware", .path = "examples/middleware.zig", .desc = "Run CacheTransport + RetryTransport + CircuitBreakerTransport example" },
+        .{ .name = "example-uds", .path = "examples/unix_socket.zig", .desc = "Run Unix Domain Socket (http+unix:// & unix_socket_path) example" },
     };
 
     const examples_step = b.step("examples", "Build all examples");

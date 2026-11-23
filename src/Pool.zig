@@ -45,6 +45,9 @@ pub const Config = struct {
     tls: ?Connection.TlsConfig = null,
     /// Optional HTTP / HTTPS forward proxy configuration.
     proxy: ?Connection.ProxyConfig = null,
+    /// Optional Unix domain socket path that routes all plain HTTP requests
+    /// through a local socket while preserving logical URL `Host` headers.
+    unix_socket_path: ?[]const u8 = null,
     /// Optional post-DNS IP address filter (e.g. `Connection.blockPrivateAddresses()`).
     address_filter: ?Connection.AddressFilter = null,
     /// Optional per-exchange observability hook (DNS/TCP/TLS connect time, TTFB, Total, reuse).
@@ -262,6 +265,7 @@ fn connectOptions(self: *Pool) Connection.ConnectOptions {
         .io = self.io,
         .tls = self.config.tls orelse .{ .system = &self.ca_store },
         .proxy = self.config.proxy,
+        .unix_socket_path = self.config.unix_socket_path,
         .address_filter = self.config.address_filter,
         .read_buffer_size = self.config.read_buffer_size,
         .write_buffer_size = self.config.write_buffer_size,
@@ -269,11 +273,11 @@ fn connectOptions(self: *Pool) Connection.ConnectOptions {
 }
 
 fn bucketOriginFor(self: *const Pool, target_origin: http.Origin) http.Origin {
-    if (target_origin.scheme == .http) {
+    if (self.config.unix_socket_path == null and target_origin.scheme == .http) {
         if (self.config.proxy) |p| {
-            if (!p.bypasses(target_origin)) {
+            if (!p.scheme.isSocks5() and !p.bypasses(target_origin)) {
                 return .{
-                    .scheme = .http,
+                    .scheme = if (p.scheme == .https) .https else .http,
                     .host = p.host,
                     .port = p.port,
                 };
@@ -577,11 +581,16 @@ const PoolExchange = struct {
         }
 
         const framing = req.body.toRequestFraming();
-        const active_proxy: ?Connection.ProxyConfig = if (pool.config.proxy) |p|
-            if (p.bypasses(req.origin)) null else p
+        const active_proxy: ?Connection.ProxyConfig = if (pool.config.unix_socket_path == null)
+            if (pool.config.proxy) |p|
+                if (p.bypasses(req.origin)) null else p
+            else
+                null
         else
             null;
-        const use_plain_proxy = active_proxy != null and req.origin.scheme == .http;
+        const use_plain_proxy = active_proxy != null and
+            !active_proxy.?.scheme.isSocks5() and
+            req.origin.scheme == .http;
 
         var abs_target_owned: ?[]u8 = null;
         defer if (abs_target_owned) |t| gpa.free(t);

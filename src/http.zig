@@ -225,17 +225,20 @@ pub const Status = enum(u16) {
 pub const Scheme = enum {
     http,
     https,
+    http_unix,
 
     pub fn defaultPort(self: Scheme) u16 {
         return switch (self) {
             .http => 80,
             .https => 443,
+            .http_unix => 0,
         };
     }
 
     pub fn parse(raw: []const u8) error{UnsupportedScheme}!Scheme {
         if (std.ascii.eqlIgnoreCase(raw, "http")) return .http;
         if (std.ascii.eqlIgnoreCase(raw, "https")) return .https;
+        if (std.ascii.eqlIgnoreCase(raw, "http+unix")) return .http_unix;
         return error.UnsupportedScheme;
     }
 };
@@ -272,6 +275,16 @@ pub const Origin = struct {
         };
         if (raw_host.len == 0) return error.MissingHost;
 
+        if (scheme == .http_unix) {
+            if (uri.port != null) return error.InvalidHost;
+            if (std.mem.findScalar(u8, raw_host, 0) != null) return error.InvalidHost;
+            return .{
+                .scheme = .http_unix,
+                .host = raw_host,
+                .port = 0,
+            };
+        }
+
         const host = stripIpv6Brackets(raw_host);
         try validateHost(host);
 
@@ -282,8 +295,16 @@ pub const Origin = struct {
         };
     }
 
-    /// Allocates an owned copy of `host` normalized to ASCII lowercase.
+    /// Allocates an owned copy of `host` (ASCII-lowercased for network schemes,
+    /// case-preserving for `.http_unix` filesystem socket paths).
     pub fn dupeOwned(self: Origin, gpa: Allocator) Allocator.Error!Origin {
+        if (self.scheme == .http_unix) {
+            return .{
+                .scheme = .http_unix,
+                .host = try gpa.dupe(u8, self.host),
+                .port = 0,
+            };
+        }
         const lowered = try gpa.alloc(u8, self.host.len);
         for (self.host, 0..) |c, i| {
             lowered[i] = std.ascii.toLower(c);
@@ -301,22 +322,30 @@ pub const Origin = struct {
     }
 
     pub fn isIpv6(self: Origin) bool {
+        if (self.scheme == .http_unix) return false;
         return std.mem.findScalar(u8, self.host, ':') != null;
     }
 
-    /// Two Origins are equal iff scheme, ASCII-lowercased host, and effective port match.
+    /// Two Origins are equal iff scheme, effective port, and host match
+    /// (case-insensitive for HTTP/HTTPS hostnames; case-sensitive for Unix socket paths).
     pub fn eql(a: Origin, b: Origin) bool {
-        return a.scheme == b.scheme and
-            a.port == b.port and
-            std.ascii.eqlIgnoreCase(a.host, b.host);
+        if (a.scheme != b.scheme or a.port != b.port) return false;
+        if (a.scheme == .http_unix) {
+            return std.mem.eql(u8, a.host, b.host);
+        }
+        return std.ascii.eqlIgnoreCase(a.host, b.host);
     }
 
-    /// Case-insensitive hash consistent with `eql`, ready for HashMap keying.
+    /// Hash consistent with `eql`, ready for HashMap keying.
     pub fn hash(self: Origin) u64 {
         var hasher = std.hash.Wyhash.init(0);
         const tag: u8 = @backingInt(self.scheme);
         hasher.update(&.{tag});
         hasher.update(std.mem.asBytes(&self.port));
+        if (self.scheme == .http_unix) {
+            hasher.update(self.host);
+            return hasher.final();
+        }
         var lower_buf: [64]u8 = undefined;
         var offset: usize = 0;
         while (offset < self.host.len) {
@@ -331,8 +360,13 @@ pub const Origin = struct {
     }
 
     /// Writes the canonical HTTP/1.1 `Host` header value (RFC 9110 §7.2):
-    /// wraps IPv6 literals in `[...]`, omits default port (80 / 443).
+    /// wraps IPv6 literals in `[...]`, omits default port (80 / 443), and uses
+    /// `localhost` for `.http_unix` socket targets.
     pub fn writeHostHeader(self: Origin, w: *Writer) Writer.Error!void {
+        if (self.scheme == .http_unix) {
+            try w.writeAll("localhost");
+            return;
+        }
         if (self.isIpv6()) {
             try w.writeByte('[');
             try w.writeAll(self.host);
@@ -852,4 +886,30 @@ test "Headers preserves multi-value order, matches case-insensitively, and block
     try std.testing.expectError(error.InvalidHeaderName, headers.append(gpa, "Bad Name", "v"));
     try std.testing.expectError(error.InvalidHeaderName, headers.append(gpa, "Bad:Name", "v"));
     try std.testing.expectError(error.InvalidHeaderName, headers.append(gpa, "Bad\r\nName", "v"));
+}
+
+test "Origin http+unix decodes socket path case-sensitively and emits localhost Host" {
+    var b1: [Origin.max_host_len]u8 = undefined;
+    var b2: [Origin.max_host_len]u8 = undefined;
+
+    const uri1 = try std.Uri.parse("http+unix://%2Ftmp%2FMyApp.sock/v1/ping");
+    const uri2 = try std.Uri.parse("http+unix://%2Ftmp%2Fmyapp.sock/v1/ping");
+    const o1 = try Origin.fromUri(uri1, &b1);
+    const o2 = try Origin.fromUri(uri2, &b2);
+
+    try std.testing.expectEqual(Scheme.http_unix, o1.scheme);
+    try std.testing.expectEqualStrings("/tmp/MyApp.sock", o1.host);
+    try std.testing.expectEqual(@as(u16, 0), o1.port);
+    try std.testing.expect(!o1.eql(o2));
+
+    var owned = try o1.dupeOwned(std.testing.allocator);
+    defer owned.deinitOwned(std.testing.allocator);
+    try std.testing.expectEqualStrings("/tmp/MyApp.sock", owned.host);
+    try std.testing.expect(owned.eql(o1));
+    try std.testing.expectEqual(o1.hash(), owned.hash());
+
+    var hbuf: [32]u8 = undefined;
+    var hw: Writer = .fixed(&hbuf);
+    try o1.writeHostHeader(&hw);
+    try std.testing.expectEqualStrings("localhost", hw.buffered());
 }
