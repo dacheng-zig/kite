@@ -9,8 +9,11 @@ const Allocator = std.mem.Allocator;
 const Reader = std.Io.Reader;
 const Writer = std.Io.Writer;
 
+const kite_build_options = @import("kite_build_options");
 const zio = @import("zio");
 const http = @import("http.zig");
+
+const default_boundary_prefix = "----" ++ kite_build_options.name;
 
 /// Finished multipart payload ready to attach to a request.
 pub const Form = struct {
@@ -44,13 +47,13 @@ pub const Builder = struct {
     buf: std.ArrayList(u8) = .empty,
     finished: bool = false,
 
-    /// Creates a builder with a cryptographically random boundary (`----kite<32 hex>`).
+    /// Creates a builder with a cryptographically random boundary (`----<name><32 hex>`).
     pub fn init(gpa: Allocator) (Allocator.Error || zio.RandomSecureError)!Builder {
         var rnd: [16]u8 = undefined;
         try zio.randomSecure(&rnd);
 
         const hex = "0123456789abcdef";
-        const prefix = "----kite";
+        const prefix = default_boundary_prefix;
         const boundary = try gpa.alloc(u8, prefix.len + rnd.len * 2);
         @memcpy(boundary[0..prefix.len], prefix);
         for (rnd, 0..) |b, i| {
@@ -164,7 +167,7 @@ pub const StreamWriter = struct {
         try zio.randomSecure(&rnd);
 
         const hex = "0123456789abcdef";
-        const prefix = "----kite";
+        const prefix = default_boundary_prefix;
         const boundary = try gpa.alloc(u8, prefix.len + rnd.len * 2);
         errdefer gpa.free(boundary);
         @memcpy(boundary[0..prefix.len], prefix);
@@ -335,8 +338,8 @@ test "multipart Builder generates cryptographically random boundaries" {
     var b2 = try Builder.init(gpa);
     defer b2.deinit();
 
-    try std.testing.expect(std.mem.startsWith(u8, b1.boundary, "----kite"));
-    try std.testing.expectEqual(@as(usize, 40), b1.boundary.len);
+    try std.testing.expect(std.mem.startsWith(u8, b1.boundary, default_boundary_prefix));
+    try std.testing.expectEqual(@as(usize, default_boundary_prefix.len + 32), b1.boundary.len);
     try std.testing.expect(!std.mem.eql(u8, b1.boundary, b2.boundary));
 }
 
